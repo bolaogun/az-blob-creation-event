@@ -1,0 +1,282 @@
+# Configure the Azure Provider
+terraform {
+  required_providers {
+    azurerm = {
+      source  = "hashicorp/azurerm"
+      version = "~>3.0"
+    }
+    http = {
+      source  = "hashicorp/http"
+      version = "~>3.0"
+    }
+  }
+}
+
+# Configure the Microsoft Azure Provider
+provider "azurerm" {
+  features {}
+}
+
+# Variables
+variable "gitlab_access_token" {
+  description = "GitLab access token for package registry"
+  type        = string
+  sensitive   = true
+}
+
+variable "gitlab_project_id" {
+  description = "GitLab project ID where the package is stored"
+  type        = string
+}
+
+variable "gitlab_package_name" {
+  description = "Name of the package in GitLab package registry"
+  type        = string
+}
+
+variable "gitlab_package_version" {
+  description = "Version of the package to deploy"
+  type        = string
+}
+
+variable "gitlab_base_url" {
+  description = "GitLab base URL (default: https://gitlab.com)"
+  type        = string
+  default     = "https://gitlab.com"
+}
+
+variable "function_app_name" {
+  description = "Name of the Azure Function App"
+  type        = string
+}
+
+variable "storage_account_name" {
+  description = "Name of the storage account for the function app"
+  type        = string
+}
+
+variable "blob_storage_account_name" {
+  description = "Name of the storage account for blob events"
+  type        = string
+}
+
+variable "blob_container_name" {
+  description = "Name of the blob container to monitor"
+  type        = string
+  default     = "monitored-container"
+}
+
+# Resource Group
+resource "azurerm_resource_group" "main" {
+  name     = "rg-${var.function_app_name}"
+  location = "UK South"
+}
+
+# Storage Account for Function App
+resource "azurerm_storage_account" "function_storage" {
+  name                     = var.storage_account_name
+  resource_group_name      = azurerm_resource_group.main.name
+  location                 = azurerm_resource_group.main.location
+  account_tier             = "Standard"
+  account_replication_type = "LRS"
+}
+
+# Storage Account for Blob Events
+resource "azurerm_storage_account" "blob_storage" {
+  name                     = var.blob_storage_account_name
+  resource_group_name      = azurerm_resource_group.main.name
+  location                 = azurerm_resource_group.main.location
+  account_tier             = "Standard"
+  account_replication_type = "LRS"
+}
+
+# Blob Container to Monitor
+resource "azurerm_storage_container" "monitored_container" {
+  name                  = var.blob_container_name
+  storage_account_name  = azurerm_storage_account.blob_storage.name
+  container_access_type = "private"
+}
+
+# Storage Container for Function Package
+resource "azurerm_storage_container" "function_package" {
+  name                  = "function-packages"
+  storage_account_name  = azurerm_storage_account.function_storage.name
+  container_access_type = "private"
+}
+
+# App Service Plan
+resource "azurerm_service_plan" "main" {
+  name                = "asp-${var.function_app_name}"
+  resource_group_name = azurerm_resource_group.main.name
+  location            = azurerm_resource_group.main.location
+  os_type             = "Linux"
+  sku_name            = "Y1"  # Consumption plan
+}
+
+# Application Insights
+resource "azurerm_application_insights" "main" {
+  name                = "ai-${var.function_app_name}"
+  resource_group_name = azurerm_resource_group.main.name
+  location            = azurerm_resource_group.main.location
+  application_type    = "web"
+}
+
+# Download the ZIP file from GitLab Package Registry
+data "http" "gitlab_package" {
+  url = "${var.gitlab_base_url}/api/v4/projects/${var.gitlab_project_id}/packages/generic/${var.gitlab_package_name}/${var.gitlab_package_version}/${var.gitlab_package_name}.zip"
+  
+  request_headers = {
+    "PRIVATE-TOKEN" = var.gitlab_access_token
+  }
+}
+
+# Create local ZIP file from downloaded content
+resource "local_file" "function_package" {
+  content_base64 = base64encode(data.http.gitlab_package.response_body)
+  filename       = "${path.module}/function-package.zip"
+}
+
+# Upload the ZIP file to Azure Storage
+resource "azurerm_storage_blob" "function_package" {
+  name                   = "function-package-${var.gitlab_package_version}.zip"
+  storage_account_name   = azurerm_storage_account.function_storage.name
+  storage_container_name = azurerm_storage_container.function_package.name
+  type                   = "Block"
+  source                 = local_file.function_package.filename
+  content_md5            = md5(data.http.gitlab_package.response_body)
+}
+
+# Generate SAS URL for the function package
+data "azurerm_storage_account_blob_container_sas" "function_package" {
+  connection_string = azurerm_storage_account.function_storage.primary_connection_string
+  container_name    = azurerm_storage_container.function_package.name
+  https_only        = true
+
+  start  = "2024-01-01T00:00:00Z"
+  expiry = "2030-01-01T00:00:00Z"
+
+  permissions {
+    read   = true
+    add    = false
+    create = false
+    write  = false
+    delete = false
+    list   = false
+  }
+}
+
+# Linux Function App with CloudEvents support
+resource "azurerm_linux_function_app" "main" {
+  name                = var.function_app_name
+  resource_group_name = azurerm_resource_group.main.name
+  location            = azurerm_resource_group.main.location
+
+  storage_account_name       = azurerm_storage_account.function_storage.name
+  storage_account_access_key = azurerm_storage_account.function_storage.primary_access_key
+  service_plan_id            = azurerm_service_plan.main.id
+
+  site_config {
+    application_stack {
+      python_version = "3.11"
+    }
+  }
+
+  app_settings = {
+    "WEBSITE_RUN_FROM_PACKAGE"           = "https://${azurerm_storage_account.function_storage.name}.blob.core.windows.net/${azurerm_storage_container.function_package.name}/${azurerm_storage_blob.function_package.name}${data.azurerm_storage_account_blob_container_sas.function_package.sas}"
+    "FUNCTIONS_WORKER_RUNTIME"           = "python"
+    "FUNCTIONS_EXTENSION_VERSION"        = "~4"
+    "APPINSIGHTS_INSTRUMENTATIONKEY"     = azurerm_application_insights.main.instrumentation_key
+    "APPLICATIONINSIGHTS_CONNECTION_STRING" = azurerm_application_insights.main.connection_string
+    "AzureWebJobsDisableHomepage"        = "true"
+    "PACKAGE_HASH"                       = md5(data.http.gitlab_package.response_body)
+  }
+
+  lifecycle {
+    replace_triggered_by = [
+      azurerm_storage_blob.function_package
+    ]
+  }
+}
+
+# Event Grid System Topic for Storage Account
+resource "azurerm_eventgrid_system_topic" "blob_storage" {
+  name                   = "eg-${var.blob_storage_account_name}"
+  resource_group_name    = azurerm_resource_group.main.name
+  location               = azurerm_resource_group.main.location
+  source_arm_resource_id = azurerm_storage_account.blob_storage.id
+  topic_type             = "Microsoft.Storage.StorageAccounts"
+}
+
+# Event Grid Event Subscription with CloudEvents v1.0 schema
+resource "azurerm_eventgrid_event_subscription" "blob_created" {
+  name  = "blob-created-subscription"
+  scope = azurerm_storage_account.blob_storage.id
+
+  webhook_endpoint {
+    url = "https://${azurerm_linux_function_app.main.default_hostname}/runtime/webhooks/EventGrid?functionName=BlobCreatedHandler"
+  }
+
+  # Use CloudEvents v1.0 schema
+  event_delivery_schema = "CloudEventSchemaV1_0"
+
+  # Filter for BlobCreated events
+  included_event_types = [
+    "Microsoft.Storage.BlobCreated"
+  ]
+
+  # Subject filter for specific container
+  subject_filter {
+    subject_begins_with = "/blobServices/default/containers/${var.blob_container_name}/"
+  }
+
+  # Advanced filters can be added here if needed
+  advanced_filter {
+    string_begins_with {
+      key    = "subject"
+      values = ["/blobServices/default/containers/${var.blob_container_name}/blobs/"]
+    }
+  }
+
+  retry_policy {
+    event_time_to_live    = 1440
+    max_delivery_attempts = 30
+  }
+
+  depends_on = [azurerm_linux_function_app.main]
+}
+
+# Output values
+output "function_app_name" {
+  value = azurerm_linux_function_app.main.name
+}
+
+output "function_app_url" {
+  value = "https://${azurerm_linux_function_app.main.default_hostname}"
+}
+
+output "storage_account_name" {
+  value = azurerm_storage_account.blob_storage.name
+}
+
+output "blob_container_name" {
+  value = azurerm_storage_container.monitored_container.name
+}
+
+output "event_grid_topic_name" {
+  value = azurerm_eventgrid_system_topic.blob_storage.name
+}
+
+output "gitlab_package_hash" {
+  value = md5(data.http.gitlab_package.response_body)
+}
+
+# Example terraform.tfvars file
+# Create a terraform.tfvars file with the following content:
+# gitlab_access_token = "your-gitlab-access-token"
+# gitlab_project_id = "your-project-id"
+# gitlab_package_name = "your-package-name"
+# gitlab_package_version = "1.0.0"
+# function_app_name = "my-cloudevents-function"
+# storage_account_name = "mystorageaccount001"
+# blob_storage_account_name = "myblobstorage001"
+# blob_container_name = "monitored-container"

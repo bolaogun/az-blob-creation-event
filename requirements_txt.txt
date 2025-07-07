@@ -1,0 +1,29 @@
+# Azure Functions Python Requirements
+
+# Core Azure Functions
+azure-functions>=1.18.0
+azure-functions-worker>=1.0.0
+
+# Azure SDK packages for CloudEvents
+azure-messaging>=1.0.0
+azure-core>=1.29.0
+azure-storage-blob>=12.19.0
+
+# Event Grid and CloudEvents
+azure-eventgrid>=4.17.0
+
+# Logging and utilities
+azure-monitor-opentelemetry>=1.0.0
+opencensus-ext-azure>=1.1.0
+
+# JSON and data processing
+pydantic>=2.0.0
+python-dateutil>=2.8.0
+
+# HTTP client
+requests>=2.31.0
+aiohttp>=3.8.0
+
+# Development and testing (optional)
+pytest>=7.0.0
+pytest-asyncio>=0.21.0
